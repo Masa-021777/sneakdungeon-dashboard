@@ -44,4 +44,25 @@ class PlayController extends Controller
 
         return response()->json(['status' => 'ok', 'id' => $play->id], 200);
     }
+
+    public function rankings(Request $request)
+{
+    $sort = $request->query('sort', 'time'); // time または mission
+    $limit = $request->query('limit', 50);
+
+    $query = Play::query();
+
+    if ($sort === 'mission') {
+        $query->orderByDesc('mission_count')->orderBy('clear_time');
+    } else {
+        $query->whereNotNull('clear_time')->orderBy('clear_time');
+    }
+
+    $plays = $query->limit($limit)->get([
+        'player_name', 'clear_time', 'mission_count', 'room_id', 'played_at'
+    ]);
+
+    return response()->json($plays);
 }
+}
+
