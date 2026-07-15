@@ -140,4 +140,73 @@ class PlayController extends Controller
             'mission_distribution' => $missionDistribution,
         ]);
     }
+
+    public function export()
+{
+    $fileName = 'play_logs_' . now()->format('Ymd_His') . '.csv';
+
+    $headers = [
+        'Content-Type' => 'text/csv; charset=UTF-8',
+        'Cache-Control' => 'no-store, no-cache',
+    ];
+
+    $callback = function () {
+        $output = fopen('php://output', 'w');
+
+        // Excelで日本語が文字化けしにくいようUTF-8 BOMを付ける
+        fwrite($output, "\xEF\xBB\xBF");
+
+        fputcsv($output, [
+            'id',
+            'session_id',
+            'player_name',
+            'clear_time',
+            'mission_count',
+            'mission1_done',
+            'mission2_done',
+            'mission3_done',
+            'death_count',
+            'punch_count',
+            'chat_count',
+            'stamina_item_count',
+            'room_id',
+            'played_at',
+            'created_at',
+            'updated_at',
+        ]);
+
+        Play::orderBy('played_at')
+            ->orderBy('id')
+            ->chunk(500, function ($plays) use ($output) {
+                foreach ($plays as $play) {
+                    fputcsv($output, [
+                        $play->id,
+                        $play->session_id,
+                        $play->player_name,
+                        $play->clear_time ?? '',
+                        $play->mission_count,
+                        $play->mission1_done ? 1 : 0,
+                        $play->mission2_done ? 1 : 0,
+                        $play->mission3_done ? 1 : 0,
+                        $play->death_count,
+                        $play->punch_count,
+                        $play->chat_count,
+                        $play->stamina_item_count,
+                        $play->room_id,
+                        optional($play->played_at)->format('Y-m-d H:i:s'),
+                        optional($play->created_at)->format('Y-m-d H:i:s'),
+                        optional($play->updated_at)->format('Y-m-d H:i:s'),
+                    ]);
+                }
+            });
+
+        fclose($output);
+    };
+
+    return response()->streamDownload(
+        $callback,
+        $fileName,
+        $headers
+    );
+}
 }

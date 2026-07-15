@@ -24,3 +24,5 @@ Route::post('/plays', [PlayController::class, 'store']);
 Route::get('/rankings', [PlayController::class, 'rankings']);
 
 Route::get('/stats', [PlayController::class, 'stats']);
+
+Route::get('/export', [PlayController::class, 'export']);
