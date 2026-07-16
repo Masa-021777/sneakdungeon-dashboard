@@ -21,6 +21,7 @@ class Play extends Model
         'punch_count',
         'chat_count',
         'stamina_item_count',
+        'sneak_time',
         'room_id',
         'played_at',
     ];

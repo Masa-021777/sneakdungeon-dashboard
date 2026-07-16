@@ -22,6 +22,7 @@ class PlayController extends Controller
             'punch_count' => 'required|integer|min:0',
             'chat_count' => 'required|integer|min:0',
             'stamina_item_count' => 'required|integer|min:0',
+            'sneak_time' => 'nullable|numeric|min:0',
             'room_id' => 'required|string|max:20',
             'played_at' => 'nullable|date',
         ]);
@@ -38,6 +39,7 @@ class PlayController extends Controller
             'punch_count' => $validated['punch_count'],
             'chat_count' => $validated['chat_count'],
             'stamina_item_count' => $validated['stamina_item_count'],
+            'sneak_time' => $validated['sneak_time'] ?? 0,
             'room_id' => $validated['room_id'],
             'played_at' => $validated['played_at'] ?? now(),
         ]);
@@ -78,19 +80,14 @@ class PlayController extends Controller
     public function stats(Request $request)
     {
         $validated = $request->validate([
+            'scope' => 'nullable|in:all,player,pair',
             'player_name' => 'nullable|string|max:100',
+            'pair_key' => 'nullable|string|max:500',
         ]);
 
-        $selectedPlayer = $validated['player_name'] ?? null;
-        $selectedPlayer = $selectedPlayer !== null && $selectedPlayer !== ''
-            ? $selectedPlayer
-            : null;
-
-        $baseQuery = Play::query();
-
-        if ($selectedPlayer !== null) {
-            $baseQuery->where('player_name', $selectedPlayer);
-        }
+        $scope = $validated['scope'] ?? 'all';
+        $selectedPlayer = trim($validated['player_name'] ?? '');
+        $selectedPairKey = $validated['pair_key'] ?? '';
 
         $playerNames = Play::query()
             ->whereNotNull('player_name')
@@ -100,122 +97,59 @@ class PlayController extends Controller
             ->pluck('player_name')
             ->values();
 
-        $playerSummaries = Play::query()
-            ->selectRaw(
-                'player_name,
-                 COUNT(*) AS play_count,
-                 SUM(CASE WHEN clear_time IS NOT NULL THEN 1 ELSE 0 END) AS cleared_count,
-                 MIN(clear_time) AS best_clear_time,
-                 AVG(clear_time) AS avg_clear_time,
-                 AVG(mission_count) AS avg_mission_count'
-            )
-            ->whereNotNull('player_name')
-            ->where('player_name', '<>', '')
-            ->groupBy('player_name')
-            ->orderByDesc('play_count')
-            ->orderBy('player_name')
-            ->get()
-            ->map(function ($row) {
-                $playCount = (int) $row->play_count;
-                $clearedCount = (int) $row->cleared_count;
+        $sessionPlayers = $this->getSessionPlayers();
+
+        $pairOptions = $sessionPlayers
+            ->map(function ($rows) {
+                $names = $this->normalizePairNames($rows);
+
+                if (count($names) !== 2) {
+                    return null;
+                }
 
                 return [
-                    'player_name' => $row->player_name,
-                    'play_count' => $playCount,
-                    'cleared_count' => $clearedCount,
-                    'clear_rate' => $this->calculateRate($clearedCount, $playCount),
-                    'best_clear_time' => $row->best_clear_time !== null
-                        ? round((float) $row->best_clear_time, 2)
-                        : null,
-                    'avg_clear_time' => $row->avg_clear_time !== null
-                        ? round((float) $row->avg_clear_time, 2)
-                        : null,
-                    'avg_mission_count' => $this->roundAverage(
-                        $row->avg_mission_count ?? null
+                    'key' => base64_encode(
+                        json_encode($names, JSON_UNESCAPED_UNICODE)
                     ),
+                    'label' => implode(' × ', $names),
+                    'players' => $names,
                 ];
             })
+            ->filter()
+            ->unique('key')
+            ->sortBy('label')
             ->values();
 
-        $totalPlays = (clone $baseQuery)->count();
-        $clearedPlays = (clone $baseQuery)
-            ->whereNotNull('clear_time')
-            ->count();
+        $baseQuery = Play::query();
+        $this->applyScope(
+            $baseQuery,
+            $scope,
+            $selectedPlayer,
+            $selectedPairKey,
+            $sessionPlayers
+        );
 
-        $clearRate = $this->calculateRate($clearedPlays, $totalPlays);
+        $sessionStats = (clone $baseQuery)
+            ->selectRaw(
+                'session_id,
+                 AVG(clear_time) AS clear_time,
+                 MAX(mission_count) AS mission_count,
+                 MAX(mission1_done) AS mission1_done,
+                 MAX(mission2_done) AS mission2_done,
+                 MAX(mission3_done) AS mission3_done,
+                 MIN(room_id) AS room_id,
+                 MIN(played_at) AS played_at'
+            )
+            ->groupBy('session_id')
+            ->get();
 
-        $avgClearTime = (clone $baseQuery)
+        $gameCount = $sessionStats->count();
+
+        $avgClearTime = $sessionStats
             ->whereNotNull('clear_time')
             ->avg('clear_time');
 
-        $playsByHour = (clone $baseQuery)
-            ->selectRaw('HOUR(played_at) AS hour, COUNT(*) AS play_count')
-            ->groupByRaw('HOUR(played_at)')
-            ->orderBy('hour')
-            ->get()
-            ->keyBy('hour');
-
-        $timeRangeStats = collect(range(0, 23))
-            ->map(function ($hour) use ($playsByHour) {
-                $row = $playsByHour->get($hour);
-
-                return [
-                    'hour' => $hour,
-                    'play_count' => $row ? (int) $row->play_count : 0,
-                ];
-            })
-            ->values();
-
-        $playsByMissionCount = (clone $baseQuery)
-            ->selectRaw('mission_count, COUNT(*) AS play_count')
-            ->groupBy('mission_count')
-            ->orderBy('mission_count')
-            ->get()
-            ->keyBy('mission_count');
-
-        $missionDistribution = collect(range(0, 3))
-            ->map(function ($missionCount) use ($playsByMissionCount) {
-                $row = $playsByMissionCount->get($missionCount);
-
-                return [
-                    'mission_count' => $missionCount,
-                    'play_count' => $row ? (int) $row->play_count : 0,
-                ];
-            })
-            ->values();
-
-        $missionTotals = (clone $baseQuery)
-            ->selectRaw(
-                'SUM(CASE WHEN mission1_done = 1 THEN 1 ELSE 0 END) AS mission1_completed,
-                 SUM(CASE WHEN mission2_done = 1 THEN 1 ELSE 0 END) AS mission2_completed,
-                 SUM(CASE WHEN mission3_done = 1 THEN 1 ELSE 0 END) AS mission3_completed'
-            )
-            ->first();
-
-        $missionCompletionRates = collect([
-            [
-                'mission_number' => 1,
-                'name' => 'アイテムを取得してゴール',
-                'completed_count' => (int) ($missionTotals->mission1_completed ?? 0),
-            ],
-            [
-                'mission_number' => 2,
-                'name' => '制限時間内にゴール',
-                'completed_count' => (int) ($missionTotals->mission2_completed ?? 0),
-            ],
-            [
-                'mission_number' => 3,
-                'name' => '敵に見つからずゴール',
-                'completed_count' => (int) ($missionTotals->mission3_completed ?? 0),
-            ],
-        ])->map(function ($mission) use ($totalPlays) {
-            $mission['completion_rate'] = $this->calculateRate(
-                $mission['completed_count'],
-                $totalPlays
-            );
-
-            return $mission;
-        })->values();
+        $avgSneakTime = (clone $baseQuery)->avg('sneak_time');
 
         $actionAverages = (clone $baseQuery)
             ->selectRaw(
@@ -227,67 +161,242 @@ class PlayController extends Controller
             ->first();
 
         $averageActions = [
-            'death_count' => $this->roundAverage($actionAverages->death_count ?? null),
-            'punch_count' => $this->roundAverage($actionAverages->punch_count ?? null),
-            'chat_count' => $this->roundAverage($actionAverages->chat_count ?? null),
+            'death_count' => $this->roundAverage(
+                $actionAverages->death_count ?? null
+            ),
+            'punch_count' => $this->roundAverage(
+                $actionAverages->punch_count ?? null
+            ),
+            'chat_count' => $this->roundAverage(
+                $actionAverages->chat_count ?? null
+            ),
             'stamina_item_count' => $this->roundAverage(
                 $actionAverages->stamina_item_count ?? null
             ),
         ];
 
-        $roomStats = (clone $baseQuery)
-            ->selectRaw('room_id, COUNT(*) AS play_count')
+        $hourCounts = $sessionStats
+            ->filter(function ($row) {
+                return $row->played_at !== null;
+            })
+            ->groupBy(function ($row) {
+                return (int) date(
+                    'G',
+                    strtotime((string) $row->played_at)
+                );
+            })
+            ->map(function ($rows) {
+                return $rows->count();
+            });
+
+        $timeRangeStats = collect(range(0, 23))
+            ->map(function ($hour) use ($hourCounts) {
+                return [
+                    'hour' => $hour,
+                    'play_count' => (int) ($hourCounts->get($hour) ?? 0),
+                ];
+            })
+            ->values();
+
+        $missionCounts = $sessionStats
+            ->groupBy(function ($row) {
+                return (int) $row->mission_count;
+            })
+            ->map(function ($rows) {
+                return $rows->count();
+            });
+
+        $missionDistribution = collect(range(0, 3))
+            ->map(function ($missionCount) use ($missionCounts) {
+                return [
+                    'mission_count' => $missionCount,
+                    'play_count' => (int) (
+                        $missionCounts->get($missionCount) ?? 0
+                    ),
+                ];
+            })
+            ->values();
+
+        $missionCompletionRates = collect([
+            [
+                'mission_number' => 1,
+                'name' => 'アイテムを取得してゴール',
+                'completed_count' => $sessionStats
+                    ->where('mission1_done', 1)
+                    ->count(),
+            ],
+            [
+                'mission_number' => 2,
+                'name' => '制限時間内にゴール',
+                'completed_count' => $sessionStats
+                    ->where('mission2_done', 1)
+                    ->count(),
+            ],
+            [
+                'mission_number' => 3,
+                'name' => '敵に見つからずゴール',
+                'completed_count' => $sessionStats
+                    ->where('mission3_done', 1)
+                    ->count(),
+            ],
+        ])->map(function ($mission) use ($gameCount) {
+            $mission['completion_rate'] = $this->calculateRate(
+                $mission['completed_count'],
+                $gameCount
+            );
+
+            return $mission;
+        })->values();
+
+        $roomStats = $sessionStats
             ->groupBy('room_id')
+            ->map(function ($rows, $roomId) {
+                return [
+                    'room_id' => $roomId,
+                    'play_count' => $rows->count(),
+                ];
+            })
+            ->sortByDesc('play_count')
+            ->values();
+
+        $playerSummaries = Play::query()
+            ->selectRaw(
+                'player_name,
+                 COUNT(DISTINCT session_id) AS play_count,
+                 MIN(clear_time) AS best_clear_time,
+                 AVG(clear_time) AS avg_clear_time,
+                 AVG(sneak_time) AS avg_sneak_time,
+                 AVG(mission_count) AS avg_mission_count'
+            )
+            ->whereNotNull('player_name')
+            ->where('player_name', '<>', '')
+            ->groupBy('player_name')
             ->orderByDesc('play_count')
-            ->orderBy('room_id')
+            ->orderBy('player_name')
             ->get()
             ->map(function ($row) {
                 return [
-                    'room_id' => $row->room_id,
+                    'player_name' => $row->player_name,
                     'play_count' => (int) $row->play_count,
+                    'best_clear_time' =>
+                        $row->best_clear_time !== null
+                            ? round((float) $row->best_clear_time, 2)
+                            : null,
+                    'avg_clear_time' =>
+                        $row->avg_clear_time !== null
+                            ? round((float) $row->avg_clear_time, 2)
+                            : null,
+                    'avg_sneak_time' =>
+                        $this->roundAverage($row->avg_sneak_time),
+                    'avg_mission_count' =>
+                        $this->roundAverage($row->avg_mission_count),
+                ];
+            })
+            ->values();
+
+        $playHistory = (clone $baseQuery)
+            ->orderByDesc('played_at')
+            ->orderByDesc('id')
+            ->limit(100)
+            ->get([
+                'id',
+                'session_id',
+                'player_name',
+                'clear_time',
+                'mission_count',
+                'death_count',
+                'punch_count',
+                'chat_count',
+                'stamina_item_count',
+                'sneak_time',
+                'room_id',
+                'played_at',
+            ])
+            ->map(function ($play) {
+                return [
+                    'id' => $play->id,
+                    'session_id' => $play->session_id,
+                    'player_name' => $play->player_name,
+                    'clear_time' =>
+                        $play->clear_time !== null
+                            ? round((float) $play->clear_time, 2)
+                            : null,
+                    'mission_count' => (int) $play->mission_count,
+                    'death_count' => (int) $play->death_count,
+                    'punch_count' => (int) $play->punch_count,
+                    'chat_count' => (int) $play->chat_count,
+                    'stamina_item_count' =>
+                        (int) $play->stamina_item_count,
+                    'sneak_time' =>
+                        round((float) ($play->sneak_time ?? 0), 2),
+                    'room_id' => $play->room_id,
+                    'played_at' =>
+                        $play->played_at !== null
+                            ? date(
+                                'Y-m-d H:i:s',
+                                strtotime((string) $play->played_at)
+                            )
+                            : null,
                 ];
             })
             ->values();
 
         return response()->json([
+            'selected_scope' => $scope,
             'selected_player' => $selectedPlayer,
+            'selected_pair_key' => $selectedPairKey,
             'player_names' => $playerNames,
-            'player_summaries' => $playerSummaries,
-            'total_plays' => $totalPlays,
-            'cleared_plays' => $clearedPlays,
-            'clear_rate' => $clearRate,
-            'avg_clear_time' => $avgClearTime !== null
-                ? round((float) $avgClearTime, 2)
-                : null,
+            'pair_options' => $pairOptions,
+            'game_count' => $gameCount,
+            'avg_clear_time' =>
+                $avgClearTime !== null
+                    ? round((float) $avgClearTime, 2)
+                    : null,
+            'avg_sneak_time' =>
+                $this->roundAverage($avgSneakTime),
+            'average_actions' => $averageActions,
             'time_range_stats' => $timeRangeStats,
             'mission_distribution' => $missionDistribution,
             'mission_completion_rates' => $missionCompletionRates,
-            'average_actions' => $averageActions,
             'room_stats' => $roomStats,
+            'player_summaries' => $playerSummaries,
+            'play_history' => $playHistory,
         ]);
     }
 
     public function export(Request $request)
     {
         $validated = $request->validate([
+            'scope' => 'nullable|in:all,player,pair',
             'player_name' => 'nullable|string|max:100',
+            'pair_key' => 'nullable|string|max:500',
         ]);
 
-        $selectedPlayer = $validated['player_name'] ?? null;
-        $selectedPlayer = $selectedPlayer !== null && $selectedPlayer !== ''
-            ? $selectedPlayer
-            : null;
+        $scope = $validated['scope'] ?? 'all';
+        $selectedPlayer = trim($validated['player_name'] ?? '');
+        $selectedPairKey = $validated['pair_key'] ?? '';
 
-        $fileName = $selectedPlayer === null
-            ? 'play_logs_all_' . now()->format('Ymd_His') . '.csv'
-            : 'play_logs_player_' . now()->format('Ymd_His') . '.csv';
+        $query = Play::query();
+
+        $this->applyScope(
+            $query,
+            $scope,
+            $selectedPlayer,
+            $selectedPairKey,
+            $this->getSessionPlayers()
+        );
+
+        $fileName = 'play_logs_' .
+            $scope . '_' .
+            now()->format('Ymd_His') .
+            '.csv';
 
         $headers = [
             'Content-Type' => 'text/csv; charset=UTF-8',
             'Cache-Control' => 'no-store, no-cache',
         ];
 
-        $callback = function () use ($selectedPlayer) {
+        $callback = function () use ($query) {
             $output = fopen('php://output', 'w');
 
             fwrite($output, "\xEF\xBB\xBF");
@@ -305,19 +414,15 @@ class PlayController extends Controller
                 'punch_count',
                 'chat_count',
                 'stamina_item_count',
+                'sneak_time',
                 'room_id',
                 'played_at',
                 'created_at',
                 'updated_at',
             ]);
 
-            $query = Play::query();
-
-            if ($selectedPlayer !== null) {
-                $query->where('player_name', $selectedPlayer);
-            }
-
-            $query->orderBy('played_at')
+            $query
+                ->orderBy('played_at')
                 ->orderBy('id')
                 ->chunk(500, function ($plays) use ($output) {
                     foreach ($plays as $play) {
@@ -334,10 +439,26 @@ class PlayController extends Controller
                             $play->punch_count,
                             $play->chat_count,
                             $play->stamina_item_count,
+                            $play->sneak_time ?? 0,
                             $play->room_id,
-                            optional($play->played_at)->format('Y-m-d H:i:s'),
-                            optional($play->created_at)->format('Y-m-d H:i:s'),
-                            optional($play->updated_at)->format('Y-m-d H:i:s'),
+                            $play->played_at !== null
+                                ? date(
+                                    'Y-m-d H:i:s',
+                                    strtotime((string) $play->played_at)
+                                )
+                                : '',
+                            $play->created_at !== null
+                                ? date(
+                                    'Y-m-d H:i:s',
+                                    strtotime((string) $play->created_at)
+                                )
+                                : '',
+                            $play->updated_at !== null
+                                ? date(
+                                    'Y-m-d H:i:s',
+                                    strtotime((string) $play->updated_at)
+                                )
+                                : '',
                         ]);
                     }
                 });
@@ -352,6 +473,106 @@ class PlayController extends Controller
         );
     }
 
+    private function getSessionPlayers()
+    {
+        return Play::query()
+            ->whereNotNull('session_id')
+            ->where('session_id', '<>', '')
+            ->whereNotNull('player_name')
+            ->where('player_name', '<>', '')
+            ->get([
+                'session_id',
+                'player_name',
+            ])
+            ->groupBy('session_id');
+    }
+
+    private function applyScope(
+        $query,
+        string $scope,
+        string $selectedPlayer,
+        string $selectedPairKey,
+        $sessionPlayers
+    ): void {
+        if ($scope === 'player') {
+            if ($selectedPlayer === '') {
+                $query->whereRaw('1 = 0');
+                return;
+            }
+
+            $query->where('player_name', $selectedPlayer);
+            return;
+        }
+
+        if ($scope === 'pair') {
+            $pairNames = $this->decodePairKey($selectedPairKey);
+
+            if (count($pairNames) !== 2) {
+                $query->whereRaw('1 = 0');
+                return;
+            }
+
+            $sessionIds = $sessionPlayers
+                ->filter(function ($rows) use ($pairNames) {
+                    return $this->normalizePairNames($rows) === $pairNames;
+                })
+                ->keys()
+                ->values()
+                ->all();
+
+            if (empty($sessionIds)) {
+                $query->whereRaw('1 = 0');
+                return;
+            }
+
+            $query->whereIn('session_id', $sessionIds);
+        }
+    }
+
+    private function normalizePairNames($rows): array
+    {
+        $names = $rows
+            ->pluck('player_name')
+            ->filter(function ($name) {
+                return $name !== null
+                    && trim((string) $name) !== '';
+            })
+            ->map(function ($name) {
+                return (string) $name;
+            })
+            ->values()
+            ->all();
+
+        natcasesort($names);
+
+        return array_values($names);
+    }
+
+    private function decodePairKey(?string $pairKey): array
+    {
+        if (empty($pairKey)) {
+            return [];
+        }
+
+        $decoded = base64_decode($pairKey, true);
+
+        if ($decoded === false) {
+            return [];
+        }
+
+        $names = json_decode($decoded, true);
+
+        if (!is_array($names) || count($names) !== 2) {
+            return [];
+        }
+
+        $names = array_map('strval', $names);
+
+        natcasesort($names);
+
+        return array_values($names);
+    }
+
     private function calculateRate(int $completedCount, int $totalCount): float
     {
         if ($totalCount === 0) {
@@ -363,6 +584,8 @@ class PlayController extends Controller
 
     private function roundAverage($value): float
     {
-        return $value !== null ? round((float) $value, 2) : 0.0;
+        return $value !== null
+            ? round((float) $value, 2)
+            : 0.0;
     }
 }
